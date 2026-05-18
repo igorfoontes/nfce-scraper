@@ -35,7 +35,29 @@ public class GeminiClient {
     private String apiKey;
 
     private final RestClient restClient = RestClient.create();
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper = new ObjectMapper()
+            .enable(com.fasterxml.jackson.core.JsonParser.Feature.ALLOW_TRAILING_COMMA)
+            .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
+    /** Strict schema so Gemini emits valid JSON conforming to NfceData. */
+    private static final Map<String, Object> RESPONSE_SCHEMA = Map.of(
+            "type", "OBJECT",
+            "properties", Map.of(
+                    "found", Map.of("type", "BOOLEAN"),
+                    "total", Map.of("type", "NUMBER", "nullable", true),
+                    "date", Map.of("type", "STRING", "nullable", true),
+                    "merchant", Map.of("type", "STRING", "nullable", true),
+                    "cnpj", Map.of("type", "STRING", "nullable", true),
+                    "items", Map.of("type", "ARRAY", "items", Map.of(
+                            "type", "OBJECT",
+                            "properties", Map.of(
+                                    "description", Map.of("type", "STRING"),
+                                    "amount", Map.of("type", "NUMBER")
+                            )
+                    ))
+            ),
+            "required", List.of("found")
+    );
 
     public boolean isAvailable() {
         return apiKey != null && !apiKey.isBlank();
@@ -45,7 +67,11 @@ public class GeminiClient {
         var prompt = buildPrompt(pageText);
         var requestBody = Map.of(
                 "contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))),
-                "generationConfig", Map.of("responseMimeType", "application/json")
+                "generationConfig", Map.of(
+                        "responseMimeType", "application/json",
+                        "responseSchema", RESPONSE_SCHEMA,
+                        "temperature", 0
+                )
         );
 
         for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -65,7 +91,7 @@ public class GeminiClient {
                 var text = (String) part.get("text");
 
                 log.info("Gemini raw response: {}", text);
-                return objectMapper.readValue(text, NfceData.class);
+                return parseNfceData(text);
 
             } catch (HttpClientErrorException e) {
                 if (e.getStatusCode().value() == 429) {
@@ -88,6 +114,31 @@ public class GeminiClient {
         }
         log.error("Gemini rate limit não resolvido após {} tentativas", MAX_RETRIES + 1);
         return null;
+    }
+
+    /** Parses the model output, repairing common malformed-JSON cases. */
+    private NfceData parseNfceData(String text) {
+        if (text == null || text.isBlank()) return null;
+        try {
+            return objectMapper.readValue(text, NfceData.class);
+        } catch (Exception first) {
+            var cleaned = text
+                    .replaceAll("(?s)```(?:json)?", "")
+                    .trim();
+            int start = cleaned.indexOf('{');
+            int end = cleaned.lastIndexOf('}');
+            if (start >= 0 && end > start) {
+                cleaned = cleaned.substring(start, end + 1);
+            }
+            // Drop lines that are only a stray '}' or ']' (model glitch).
+            cleaned = cleaned.replaceAll("(?m)^\\s*[}\\]]\\s*$\\n?", "");
+            try {
+                return objectMapper.readValue(cleaned, NfceData.class);
+            } catch (Exception second) {
+                log.error("Gemini JSON inválido mesmo após reparo: {}", second.getMessage());
+                return null;
+            }
+        }
     }
 
     private String buildPrompt(String pageText) {
